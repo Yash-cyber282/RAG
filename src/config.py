@@ -1,8 +1,9 @@
 """
 config.py — All settings from environment variables.
-Fully LOCAL stack — no API keys needed:
+Fully LOCAL stack — zero API keys:
+  - LLM: HuggingFace Transformers (local inference)
   - Embeddings: sentence-transformers (local)
-  - LLM: Ollama (local) — https://ollama.com
+  - Vector store: ChromaDB (local)
 """
 from __future__ import annotations
 import os
@@ -18,23 +19,18 @@ except ImportError:
 
 
 class Settings:
-    def __init__(self):
-        pass
-
-    # ── Ollama (local LLM) ────────────────────────────────────────────────
+    # ── HuggingFace local LLM ─────────────────────────────────────────────
     @property
-    def ollama_base_url(self) -> str:
-        return os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-
-    @property
-    def ollama_model(self) -> str:
-        return os.environ.get("OLLAMA_MODEL", "llama3.2")
+    def hf_model(self) -> str:
+        # flan-t5-base: ~250MB, CPU-friendly, instruction-tuned
+        # swap for 'google/flan-t5-large' (800MB) or 'mistralai/Mistral-7B-Instruct-v0.3' (GPU)
+        return os.environ.get("HF_MODEL", "google/flan-t5-base")
 
     # ── ChromaDB ─────────────────────────────────────────────────────────
     @property
     def chroma_persist_dir(self) -> str:
-        env_val = os.environ.get("CHROMA_PERSIST_DIR", "")
-        return env_val if env_val else str(_PROJECT_ROOT / "data" / "chroma_db")
+        val = os.environ.get("CHROMA_PERSIST_DIR", "")
+        return val if val else str(_PROJECT_ROOT / "data" / "chroma_db")
 
     @property
     def chroma_collection_name(self) -> str:
@@ -69,8 +65,8 @@ class Settings:
     # ── Cache ─────────────────────────────────────────────────────────────
     @property
     def cache_dir(self) -> str:
-        env_val = os.environ.get("CACHE_DIR", "")
-        return env_val if env_val else str(_PROJECT_ROOT / "data" / "cache")
+        val = os.environ.get("CACHE_DIR", "")
+        return val if val else str(_PROJECT_ROOT / "data" / "cache")
 
     @property
     def cache_ttl_seconds(self) -> int:

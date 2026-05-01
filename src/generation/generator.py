@@ -1,23 +1,20 @@
 """
 generation/generator.py
 
-Fully LOCAL LLM response generation using Ollama.
-No API key. No internet. No cost.
+Fully LOCAL LLM using HuggingFace Transformers pipeline.
+No Ollama. No API key. No internet after first model download.
 
-Install Ollama: https://ollama.com/download
-Then run:  ollama pull llama3.2
-Then start: ollama serve
+Default model: google/flan-t5-base (~250MB, CPU-friendly)
+Swap via HFLOCAL_MODEL env var for larger models if you have GPU.
 """
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import Generator, Iterator
-import hashlib
-import time
+
 import diskcache
 from loguru import logger
-
-import requests
 
 from src.config import settings
 from src.retrieval.hybrid_retriever import RetrievedChunk
@@ -50,28 +47,33 @@ class GeneratedAnswer:
 
 
 # ─────────────────────────────────────────────
-# System prompt
+# System prompt / prompt builder
 # ─────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are an expert document analyst. Answer the user's question using ONLY the provided context passages.
-
-Rules:
-1. Base your answer solely on the context. Do not use prior knowledge.
-2. If the context does not contain enough information, say so clearly.
-3. Cite the specific document(s) your answer comes from using [Source: filename, p.N] inline.
-4. Be concise but complete. Use bullet points for lists.
-5. If asked about multiple documents, synthesise across all relevant sources.
-"""
-
-
-def _build_context_block(chunks: list[RetrievedChunk]) -> str:
-    parts = []
+def _build_prompt(query: str, chunks: list[RetrievedChunk], history: list[dict]) -> str:
+    context_parts = []
     for i, chunk in enumerate(chunks, 1):
-        parts.append(
-            f"[{i}] Source: {chunk.filename}, Page {chunk.page_number}\n"
-            f"{chunk.text}\n"
+        context_parts.append(
+            f"[{i}] Source: {chunk.filename}, Page {chunk.page_number}\n{chunk.text}"
         )
-    return "\n---\n".join(parts)
+    context = "\n---\n".join(context_parts)
+
+    history_str = ""
+    if history:
+        turns = []
+        for msg in history:
+            role = "User" if msg["role"] == "user" else "Assistant"
+            turns.append(f"{role}: {msg['content']}")
+        history_str = "\n".join(turns) + "\n\n"
+
+    return (
+        f"{history_str}"
+        f"You are a document analyst. Answer ONLY using the context below. "
+        f"Cite sources as [Source: filename, p.N].\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {query}\n\n"
+        f"Answer:"
+    )
 
 
 def _extract_citations(chunks: list[RetrievedChunk]) -> list[Citation]:
@@ -92,7 +94,7 @@ def _extract_citations(chunks: list[RetrievedChunk]) -> list[Citation]:
 # ─────────────────────────────────────────────
 
 class ConversationMemory:
-    def __init__(self, max_turns: int = 6) -> None:
+    def __init__(self, max_turns: int = 4) -> None:
         self.max_turns = max_turns
         self.history: list[dict] = []
 
@@ -109,41 +111,54 @@ class ConversationMemory:
 
 
 # ─────────────────────────────────────────────
-# Ollama client helpers
+# Model loader (cached in memory)
 # ─────────────────────────────────────────────
 
-def _ollama_base() -> str:
-    return settings.ollama_base_url.rstrip("/")
+_pipeline = None
 
 
-def check_ollama_running() -> tuple[bool, str]:
-    """Returns (is_running, error_message)."""
+def _get_pipeline():
+    global _pipeline
+    if _pipeline is not None:
+        return _pipeline
+
+    from transformers import pipeline as hf_pipeline
+    import torch
+
+    model_name = settings.hf_model
+    logger.info(f"Loading HuggingFace model: {model_name} (first run downloads it)")
+
+    device = 0 if torch.cuda.is_available() else -1  # GPU if available, else CPU
+    device_label = "GPU" if device == 0 else "CPU"
+    logger.info(f"Running on {device_label}")
+
+    # Detect model type for correct task
+    name_lower = model_name.lower()
+    if any(x in name_lower for x in ["t5", "bart", "pegasus"]):
+        task = "text2text-generation"
+    else:
+        task = "text-generation"
+
+    _pipeline = hf_pipeline(
+        task,
+        model=model_name,
+        device=device,
+        max_new_tokens=512,
+        do_sample=False,          # deterministic for RAG
+        temperature=None,
+        top_p=None,
+    )
+    logger.success(f"Model ready: {model_name}")
+    return _pipeline
+
+
+def check_model_ready() -> tuple[bool, str]:
+    """Check if transformers + torch are importable."""
     try:
-        r = requests.get(f"{_ollama_base()}/api/tags", timeout=3)
-        if r.status_code == 200:
-            models = [m["name"] for m in r.json().get("models", [])]
-            return True, ", ".join(models) if models else "(no models pulled yet)"
-        return False, f"Ollama returned status {r.status_code}"
-    except requests.exceptions.ConnectionError:
-        return False, "Ollama is not running. Start it with: ollama serve"
-    except Exception as e:
-        return False, str(e)
-
-
-def check_model_available(model: str) -> tuple[bool, str]:
-    """Check if a specific model is pulled locally."""
-    try:
-        r = requests.get(f"{_ollama_base()}/api/tags", timeout=3)
-        if r.status_code == 200:
-            models = [m["name"] for m in r.json().get("models", [])]
-            # Match with or without tag
-            base = model.split(":")[0]
-            for m in models:
-                if m == model or m.split(":")[0] == base:
-                    return True, m
-            return False, f"Model '{model}' not found. Run: ollama pull {model}"
-        return False, "Could not query Ollama models."
-    except Exception as e:
+        import transformers
+        import torch
+        return True, f"transformers {transformers.__version__}, torch {torch.__version__}"
+    except ImportError as e:
         return False, str(e)
 
 
@@ -153,28 +168,27 @@ def check_model_available(model: str) -> tuple[bool, str]:
 
 class RAGGenerator:
     def __init__(self) -> None:
-        self._model = settings.ollama_model
-        self._base = _ollama_base()
+        self._model_name = settings.hf_model
         self._cache = diskcache.Cache(str(settings.cache_path))
-        logger.info(f"RAGGenerator ready — Ollama model: {self._model} @ {self._base}")
+        logger.info(f"RAGGenerator initialised — model: {self._model_name}")
 
     def _cache_key(self, query: str, chunk_ids: list[str]) -> str:
         payload = query + "|" + ",".join(sorted(chunk_ids))
         return "gen:" + hashlib.md5(payload.encode()).hexdigest()
 
-    def _build_messages(
-        self,
-        query: str,
-        chunks: list[RetrievedChunk],
-        memory: ConversationMemory | None,
-    ) -> list[dict]:
-        context = _build_context_block(chunks)
-        user_content = f"Context:\n{context}\n\nQuestion: {query}"
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        if memory and memory.history:
-            messages.extend(memory.as_messages())
-        messages.append({"role": "user", "content": user_content})
-        return messages
+    def _run_inference(self, prompt: str) -> str:
+        pipe = _get_pipeline()
+        result = pipe(prompt)
+        if isinstance(result, list) and result:
+            out = result[0]
+            # text2text-generation returns {"generated_text": ...}
+            # text-generation returns {"generated_text": full_prompt + answer}
+            text = out.get("generated_text", "")
+            # Strip the prompt prefix for causal LMs
+            if text.startswith(prompt):
+                text = text[len(prompt):]
+            return text.strip()
+        return ""
 
     def generate(
         self,
@@ -185,41 +199,23 @@ class RAGGenerator:
     ) -> GeneratedAnswer:
         cache_key = self._cache_key(query, [c.chunk_id for c in chunks])
         if use_cache and cache_key in self._cache:
-            logger.debug("Cache hit — returning cached answer")
+            logger.debug("Cache hit")
             return self._cache[cache_key]
 
-        messages = self._build_messages(query, chunks, memory)
-
-        response = requests.post(
-            f"{self._base}/api/chat",
-            json={
-                "model": self._model,
-                "messages": messages,
-                "stream": False,
-                "options": {"temperature": 0.1},
-            },
-            timeout=120,
-        )
-        response.raise_for_status()
-        data = response.json()
-        answer_text = data.get("message", {}).get("content", "")
+        history = memory.as_messages() if memory else []
+        prompt = _build_prompt(query, chunks, history)
+        answer_text = self._run_inference(prompt)
 
         result = GeneratedAnswer(
             answer=answer_text,
             citations=_extract_citations(chunks),
             query=query,
-            model=self._model,
-            usage={
-                "prompt_tokens": data.get("prompt_eval_count", 0),
-                "completion_tokens": data.get("eval_count", 0),
-            },
+            model=self._model_name,
         )
-
         self._cache.set(cache_key, result, expire=settings.cache_ttl_seconds)
         if memory:
             memory.add("user", query)
             memory.add("assistant", answer_text)
-
         return result
 
     def generate_stream(
@@ -228,40 +224,21 @@ class RAGGenerator:
         chunks: list[RetrievedChunk],
         memory: ConversationMemory | None = None,
     ) -> tuple[Generator[str, None, None], list[Citation]]:
+        """
+        HuggingFace pipelines don't natively stream token-by-token easily,
+        so we run inference fully and yield word-by-word for a streaming feel.
+        """
         citations = _extract_citations(chunks)
-        messages = self._build_messages(query, chunks, memory)
+        history = memory.as_messages() if memory else []
+        prompt = _build_prompt(query, chunks, history)
 
-        def _token_stream() -> Iterator[str]:
-            import json
-            full_answer = []
-            with requests.post(
-                f"{self._base}/api/chat",
-                json={
-                    "model": self._model,
-                    "messages": messages,
-                    "stream": True,
-                    "options": {"temperature": 0.1},
-                },
-                stream=True,
-                timeout=120,
-            ) as resp:
-                resp.raise_for_status()
-                for line in resp.iter_lines():
-                    if not line:
-                        continue
-                    try:
-                        chunk = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    text = chunk.get("message", {}).get("content", "")
-                    if text:
-                        full_answer.append(text)
-                        yield text
-                    if chunk.get("done"):
-                        break
-
+        def _word_stream() -> Iterator[str]:
+            answer = self._run_inference(prompt)
+            words = answer.split(" ")
+            for i, word in enumerate(words):
+                yield word + ("" if i == len(words) - 1 else " ")
             if memory:
                 memory.add("user", query)
-                memory.add("assistant", "".join(full_answer))
+                memory.add("assistant", answer)
 
-        return _token_stream(), citations
+        return _word_stream(), citations
