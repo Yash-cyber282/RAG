@@ -2,7 +2,7 @@
 config.py — All settings from environment variables.
 Stack:
   - Embeddings: local sentence-transformers (no key needed)
-  - LLM: Anthropic Claude API — get key at https://console.anthropic.com
+  - LLM: OpenAI API — get key at https://platform.openai.com/api-keys
 """
 from __future__ import annotations
 import os
@@ -21,14 +21,14 @@ class Settings:
     def __init__(self):
         pass
 
-    # ── Anthropic Claude ──────────────────────────────────────────────────
+    # ── OpenAI ────────────────────────────────────────────────────────────
     @property
-    def anthropic_api_key(self) -> str:
-        return os.environ.get("ANTHROPIC_API_KEY", "")
+    def openai_api_key(self) -> str:
+        return os.environ.get("OPENAI_API_KEY", "")
 
     @property
-    def anthropic_model(self) -> str:
-        return os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+    def openai_model(self) -> str:
+        return os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
     # ── ChromaDB ─────────────────────────────────────────────────────────
     @property

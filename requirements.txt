@@ -1,5 +1,5 @@
 # ── LLM (FREE) ────────────────────────────────────────────────────────────────
-anthropic>=0.40.0
+openai>=1.30.0
 
 # ── Embeddings (FREE local, CPU-only) ─────────────────────────────────────────
 # Force CPU-only torch FIRST to avoid CUDA/GPU conflicts

@@ -1,15 +1,6 @@
 """
 app.py — RAG Document Intelligence (Streamlit app)
-Powered by Anthropic Claude + local sentence-transformers embeddings.
-
-Error handling covers:
-  - Missing / invalid Anthropic API key
-  - No documents indexed
-  - Empty query
-  - Retrieval failure
-  - LLM / network failure
-  - Ingestion failure per file
-  - Pipeline init failure
+Powered by OpenAI + local sentence-transformers embeddings.
 """
 import os
 import sys
@@ -62,25 +53,20 @@ for key, default in [
 
 
 def validate_api_key(key: str) -> tuple[bool, str]:
-    """Check format + live ping to Anthropic."""
+    """Check format + live ping to OpenAI."""
     if not key or not key.strip():
         return False, "API key cannot be empty."
     if len(key) < 20:
         return False, "Key looks too short. Make sure you copied it completely."
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=key)
-        # Minimal ping — list models or make a tiny message call
-        client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=5,
-            messages=[{"role": "user", "content": "hi"}],
-        )
+        from openai import OpenAI, AuthenticationError
+        client = OpenAI(api_key=key)
+        client.models.list()
         return True, "OK"
-    except anthropic.AuthenticationError:
-        return False, "Anthropic rejected this key. Check it at console.anthropic.com."
+    except AuthenticationError:
+        return False, "OpenAI rejected this key. Check it at platform.openai.com/api-keys."
     except Exception as e:
-        return False, f"Could not connect to Anthropic: {e}"
+        return False, f"Could not connect to OpenAI: {e}"
 
 
 def get_pipeline():
@@ -101,17 +87,17 @@ def reset_pipelines():
     st.session_state.pipeline = None
     st.session_state.ingest_pipeline = None
     st.session_state.api_key_validated = False
-    os.environ.pop("ANTHROPIC_API_KEY", None)
+    os.environ.pop("OPENAI_API_KEY", None)
 
 
 # ── SIDEBAR ────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("📚 Document Library")
 
-    with st.expander("🔑 Anthropic API Key", expanded=not st.session_state.api_key_validated):
-        env_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    with st.expander("🔑 OpenAI API Key", expanded=not st.session_state.api_key_validated):
+        env_key = os.environ.get("OPENAI_API_KEY", "")
         if env_key and not st.session_state.api_key_validated:
-            os.environ["ANTHROPIC_API_KEY"] = env_key
+            os.environ["OPENAI_API_KEY"] = env_key
             st.session_state.api_key_validated = True
 
         if st.session_state.api_key_validated:
@@ -121,11 +107,11 @@ with st.sidebar:
                 st.rerun()
         else:
             typed_key = st.text_input(
-                "Paste your Anthropic API key",
+                "Paste your OpenAI API key",
                 type="password",
                 placeholder="Paste your API key here",
                 key="api_key_input",
-                help="Get your key at console.anthropic.com — stored only in this session.",
+                help="Get your key at platform.openai.com/api-keys — stored only in this session.",
             )
             if st.button("✅ Validate & Save", key="validate_key"):
                 if not typed_key:
@@ -134,7 +120,7 @@ with st.sidebar:
                     with st.spinner("Validating…"):
                         ok, msg = validate_api_key(typed_key)
                     if ok:
-                        os.environ["ANTHROPIC_API_KEY"] = typed_key
+                        os.environ["OPENAI_API_KEY"] = typed_key
                         st.session_state.api_key_validated = True
                         st.success("Key validated!")
                         st.rerun()
@@ -142,7 +128,7 @@ with st.sidebar:
                         st.error(f"❌ {msg}")
 
     if not st.session_state.api_key_validated:
-        st.info("Enter your Anthropic API key above to continue. Get one at console.anthropic.com")
+        st.info("Enter your OpenAI API key above to continue. Get one at platform.openai.com/api-keys")
         st.stop()
 
     st.subheader("Upload PDFs")
@@ -260,7 +246,7 @@ with st.sidebar:
         st.caption(f"🗄 **{n:,}** chunks indexed")
     except Exception:
         st.caption("🗄 — chunks indexed")
-    st.caption("Claude Haiku (Anthropic) · all-MiniLM-L6-v2 (local) · Hybrid RAG")
+    st.caption("GPT-4o mini (OpenAI) · all-MiniLM-L6-v2 (local) · Hybrid RAG")
 
 
 # ── MAIN AREA ──────────────────────────────────────────────────────────────
@@ -297,7 +283,7 @@ if prompt:
         st.stop()
 
     if not st.session_state.api_key_validated:
-        st.error("Enter and validate your Anthropic API key in the sidebar first.")
+        st.error("Enter and validate your OpenAI API key in the sidebar first.")
         st.stop()
 
     try:
@@ -340,17 +326,17 @@ if prompt:
         except Exception as e:
             err_str = str(e)
             err_low = err_str.lower()
-            if "authentication" in err_low or "401" in err_str or "invalid" in err_low and "key" in err_low:
-                msg = "❌ **Invalid API key.** Your Anthropic key was rejected. Re-enter it in the sidebar."
+            if "authentication" in err_low or "401" in err_str or ("invalid" in err_low and "key" in err_low):
+                msg = "❌ **Invalid API key.** Your OpenAI key was rejected. Re-enter it in the sidebar."
                 reset_pipelines()
             elif "rate_limit" in err_low or "429" in err_str or "rate limit" in err_low:
-                msg = "❌ **Rate limit hit.** You've exceeded your Anthropic quota. Wait a minute or check your plan."
-            elif "overloaded" in err_low or "529" in err_str:
-                msg = "❌ **API overloaded.** Anthropic servers are busy. Please try again in a moment."
+                msg = "❌ **Rate limit hit.** You've exceeded your OpenAI quota. Wait a minute or check your plan."
+            elif "insufficient_quota" in err_low or "quota" in err_low:
+                msg = "❌ **Quota exceeded.** Add credits at platform.openai.com/account/billing."
             elif "context_length" in err_low or "too long" in err_low:
                 msg = "❌ **Context too long.** Try a more specific question."
             elif "connection" in err_low or "timeout" in err_low or "network" in err_low:
-                msg = "❌ **Network error.** Could not reach Anthropic. Check your internet connection."
+                msg = "❌ **Network error.** Could not reach OpenAI. Check your internet connection."
             elif "no documents" in err_low or "collection" in err_low:
                 msg = "❌ **No documents found.** Upload and ingest PDFs first."
             else:

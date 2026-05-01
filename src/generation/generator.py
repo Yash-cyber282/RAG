@@ -1,8 +1,8 @@
 """
 generation/generator.py
 
-LLM response generation using Anthropic Claude API.
-Get your key at: https://console.anthropic.com
+LLM response generation using OpenAI API.
+Get your key at: https://platform.openai.com/api-keys
 - Streaming support
 - Conversation memory
 - Source citation system
@@ -16,11 +16,15 @@ from typing import Generator, Iterator
 import time
 import diskcache
 from loguru import logger
-import anthropic
+from openai import OpenAI, RateLimitError, AuthenticationError
 
 from src.config import settings
 from src.retrieval.hybrid_retriever import RetrievedChunk
 
+
+# ─────────────────────────────────────────────
+# Data models
+# ─────────────────────────────────────────────
 
 @dataclass
 class Citation:
@@ -43,6 +47,10 @@ class GeneratedAnswer:
     model: str
     usage: dict = field(default_factory=dict)
 
+
+# ─────────────────────────────────────────────
+# System prompt
+# ─────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are an expert document analyst. Answer the user's question using ONLY the provided context passages.
 
@@ -78,6 +86,10 @@ def _extract_citations(chunks: list[RetrievedChunk]) -> list[Citation]:
     ]
 
 
+# ─────────────────────────────────────────────
+# Conversation memory
+# ─────────────────────────────────────────────
+
 class ConversationMemory:
     def __init__(self, max_turns: int = 6) -> None:
         self.max_turns = max_turns
@@ -95,10 +107,14 @@ class ConversationMemory:
         self.history.clear()
 
 
+# ─────────────────────────────────────────────
+# Generator
+# ─────────────────────────────────────────────
+
 class RAGGenerator:
     def __init__(self) -> None:
-        self._client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-        self._model = settings.anthropic_model
+        self._client = OpenAI(api_key=settings.openai_api_key)
+        self._model = settings.openai_model
         self._cache = diskcache.Cache(str(settings.cache_path))
         logger.info(f"RAGGenerator ready — model: {self._model}")
 
@@ -115,7 +131,7 @@ class RAGGenerator:
     ) -> list[dict]:
         context = _build_context_block(chunks)
         user_content = f"Context:\n{context}\n\nQuestion: {query}"
-        messages = []
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         if memory and memory.history:
             messages.extend(memory.as_messages())
         messages.append({"role": "user", "content": user_content})
@@ -137,23 +153,23 @@ class RAGGenerator:
 
         for attempt in range(3):
             try:
-                response = self._client.messages.create(
+                response = self._client.chat.completions.create(
                     model=self._model,
                     max_tokens=1500,
-                    system=SYSTEM_PROMPT,
+                    temperature=0.1,
                     messages=messages,
                 )
                 break
-            except anthropic.RateLimitError:
+            except RateLimitError:
                 if attempt < 2:
                     time.sleep(15)
                     continue
                 raise
 
-        answer_text = response.content[0].text if response.content else ""
+        answer_text = response.choices[0].message.content or ""
         usage = {
-            "input_tokens": response.usage.input_tokens,
-            "output_tokens": response.usage.output_tokens,
+            "input_tokens": response.usage.prompt_tokens,
+            "output_tokens": response.usage.completion_tokens,
         }
 
         result = GeneratedAnswer(
@@ -182,16 +198,18 @@ class RAGGenerator:
 
         def _token_stream() -> Iterator[str]:
             full_answer = []
-            with self._client.messages.stream(
+            stream = self._client.chat.completions.create(
                 model=self._model,
                 max_tokens=1500,
-                system=SYSTEM_PROMPT,
+                temperature=0.1,
                 messages=messages,
-            ) as stream:
-                for text in stream.text_stream:
-                    if text:
-                        full_answer.append(text)
-                        yield text
+                stream=True,
+            )
+            for chunk in stream:
+                text = chunk.choices[0].delta.content or ""
+                if text:
+                    full_answer.append(text)
+                    yield text
 
             if memory:
                 memory.add("user", query)
