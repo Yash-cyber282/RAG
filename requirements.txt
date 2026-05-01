@@ -1,0 +1,33 @@
+# ── LLM (FREE) ────────────────────────────────────────────────────────────────
+anthropic>=0.40.0
+
+# ── Embeddings (FREE local, CPU-only) ─────────────────────────────────────────
+# Force CPU-only torch FIRST to avoid CUDA/GPU conflicts
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.0.0
+torchvision
+sentence-transformers>=3.0.0
+
+# ── Vector store ──────────────────────────────────────────────────────────────
+chromadb>=0.5.0
+
+# ── PDF processing ────────────────────────────────────────────────────────────
+PyMuPDF>=1.24.0
+
+# ── BM25 retrieval ────────────────────────────────────────────────────────────
+rank-bm25>=0.2.2
+
+# ── Interface ─────────────────────────────────────────────────────────────────
+streamlit>=1.35.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0
+tenacity>=8.2.0
+tqdm>=4.66.0
+pydantic>=2.7.0
+loguru>=0.7.0
+diskcache>=5.6.0
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=8.2.0
+pytest-asyncio>=0.23.0
