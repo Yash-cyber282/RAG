@@ -65,9 +65,7 @@ def validate_api_key(key: str) -> tuple[bool, str]:
     """Check format + live ping to Anthropic."""
     if not key or not key.strip():
         return False, "API key cannot be empty."
-    if not key.startswith("sk-ant-"):
-        return False, "Anthropic keys start with 'sk-ant-'. Get yours at console.anthropic.com."
-    if len(key) < 30:
+    if len(key) < 20:
         return False, "Key looks too short. Make sure you copied it completely."
     try:
         import anthropic
@@ -125,7 +123,7 @@ with st.sidebar:
             typed_key = st.text_input(
                 "Paste your Anthropic API key",
                 type="password",
-                placeholder="sk-ant-...",
+                placeholder="Paste your API key here",
                 key="api_key_input",
                 help="Get your key at console.anthropic.com — stored only in this session.",
             )
