@@ -1,22 +1,23 @@
 """
 generation/generator.py
 
-LLM response generation using OpenAI API.
-Get your key at: https://platform.openai.com/api-keys
-- Streaming support
-- Conversation memory
-- Source citation system
-- Disk-cached responses
+Fully LOCAL LLM response generation using Ollama.
+No API key. No internet. No cost.
+
+Install Ollama: https://ollama.com/download
+Then run:  ollama pull llama3.2
+Then start: ollama serve
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Generator, Iterator
-
+import hashlib
 import time
 import diskcache
 from loguru import logger
-from openai import OpenAI, RateLimitError, AuthenticationError
+
+import requests
 
 from src.config import settings
 from src.retrieval.hybrid_retriever import RetrievedChunk
@@ -108,18 +109,56 @@ class ConversationMemory:
 
 
 # ─────────────────────────────────────────────
+# Ollama client helpers
+# ─────────────────────────────────────────────
+
+def _ollama_base() -> str:
+    return settings.ollama_base_url.rstrip("/")
+
+
+def check_ollama_running() -> tuple[bool, str]:
+    """Returns (is_running, error_message)."""
+    try:
+        r = requests.get(f"{_ollama_base()}/api/tags", timeout=3)
+        if r.status_code == 200:
+            models = [m["name"] for m in r.json().get("models", [])]
+            return True, ", ".join(models) if models else "(no models pulled yet)"
+        return False, f"Ollama returned status {r.status_code}"
+    except requests.exceptions.ConnectionError:
+        return False, "Ollama is not running. Start it with: ollama serve"
+    except Exception as e:
+        return False, str(e)
+
+
+def check_model_available(model: str) -> tuple[bool, str]:
+    """Check if a specific model is pulled locally."""
+    try:
+        r = requests.get(f"{_ollama_base()}/api/tags", timeout=3)
+        if r.status_code == 200:
+            models = [m["name"] for m in r.json().get("models", [])]
+            # Match with or without tag
+            base = model.split(":")[0]
+            for m in models:
+                if m == model or m.split(":")[0] == base:
+                    return True, m
+            return False, f"Model '{model}' not found. Run: ollama pull {model}"
+        return False, "Could not query Ollama models."
+    except Exception as e:
+        return False, str(e)
+
+
+# ─────────────────────────────────────────────
 # Generator
 # ─────────────────────────────────────────────
 
 class RAGGenerator:
     def __init__(self) -> None:
-        self._client = OpenAI(api_key=settings.openai_api_key)
-        self._model = settings.openai_model
+        self._model = settings.ollama_model
+        self._base = _ollama_base()
         self._cache = diskcache.Cache(str(settings.cache_path))
-        logger.info(f"RAGGenerator ready — model: {self._model}")
+        logger.info(f"RAGGenerator ready — Ollama model: {self._model} @ {self._base}")
 
     def _cache_key(self, query: str, chunk_ids: list[str]) -> str:
-        import hashlib
         payload = query + "|" + ",".join(sorted(chunk_ids))
         return "gen:" + hashlib.md5(payload.encode()).hexdigest()
 
@@ -151,33 +190,29 @@ class RAGGenerator:
 
         messages = self._build_messages(query, chunks, memory)
 
-        for attempt in range(3):
-            try:
-                response = self._client.chat.completions.create(
-                    model=self._model,
-                    max_tokens=1500,
-                    temperature=0.1,
-                    messages=messages,
-                )
-                break
-            except RateLimitError:
-                if attempt < 2:
-                    time.sleep(15)
-                    continue
-                raise
-
-        answer_text = response.choices[0].message.content or ""
-        usage = {
-            "input_tokens": response.usage.prompt_tokens,
-            "output_tokens": response.usage.completion_tokens,
-        }
+        response = requests.post(
+            f"{self._base}/api/chat",
+            json={
+                "model": self._model,
+                "messages": messages,
+                "stream": False,
+                "options": {"temperature": 0.1},
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+        data = response.json()
+        answer_text = data.get("message", {}).get("content", "")
 
         result = GeneratedAnswer(
             answer=answer_text,
             citations=_extract_citations(chunks),
             query=query,
             model=self._model,
-            usage=usage,
+            usage={
+                "prompt_tokens": data.get("prompt_eval_count", 0),
+                "completion_tokens": data.get("eval_count", 0),
+            },
         )
 
         self._cache.set(cache_key, result, expire=settings.cache_ttl_seconds)
@@ -197,19 +232,33 @@ class RAGGenerator:
         messages = self._build_messages(query, chunks, memory)
 
         def _token_stream() -> Iterator[str]:
+            import json
             full_answer = []
-            stream = self._client.chat.completions.create(
-                model=self._model,
-                max_tokens=1500,
-                temperature=0.1,
-                messages=messages,
+            with requests.post(
+                f"{self._base}/api/chat",
+                json={
+                    "model": self._model,
+                    "messages": messages,
+                    "stream": True,
+                    "options": {"temperature": 0.1},
+                },
                 stream=True,
-            )
-            for chunk in stream:
-                text = chunk.choices[0].delta.content or ""
-                if text:
-                    full_answer.append(text)
-                    yield text
+                timeout=120,
+            ) as resp:
+                resp.raise_for_status()
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    text = chunk.get("message", {}).get("content", "")
+                    if text:
+                        full_answer.append(text)
+                        yield text
+                    if chunk.get("done"):
+                        break
 
             if memory:
                 memory.add("user", query)

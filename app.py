@@ -1,6 +1,7 @@
 """
 app.py — RAG Document Intelligence (Streamlit app)
-Powered by OpenAI + local sentence-transformers embeddings.
+100% local. No API keys. No internet required.
+Powered by Ollama (LLM) + sentence-transformers (embeddings) + ChromaDB (vector store).
 """
 import os
 import sys
@@ -38,36 +39,26 @@ st.markdown("""
     padding: 0.8rem 1rem; margin: 0.5rem 0; color: #f08080; font-size: 0.9rem; }
 .info-card { background: #1a2a2d; border: 1px solid #1e6a72; border-radius: 6px;
     padding: 0.8rem 1rem; margin: 0.5rem 0; color: #7ecfe0; font-size: 0.9rem; }
+.setup-step { background: #1e1e2e; border: 1px solid #3a3a5c; border-radius: 6px;
+    padding: 0.7rem 1rem; margin: 0.4rem 0; font-size: 0.85rem; color: #cdd6f4; }
+.setup-step code { background: #313244; padding: 2px 6px; border-radius: 4px;
+    font-family: monospace; color: #cba6f7; }
 </style>
 """, unsafe_allow_html=True)
 
 for key, default in [
     ("messages", []),
-    ("api_key_validated", False),
+    ("ollama_ok", False),
     ("pipeline", None),
     ("ingest_pipeline", None),
     ("ingest_log", []),
+    ("selected_model", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
 
 
-def validate_api_key(key: str) -> tuple[bool, str]:
-    """Check format + live ping to OpenAI."""
-    if not key or not key.strip():
-        return False, "API key cannot be empty."
-    if len(key) < 20:
-        return False, "Key looks too short. Make sure you copied it completely."
-    try:
-        from openai import OpenAI, AuthenticationError
-        client = OpenAI(api_key=key)
-        client.models.list()
-        return True, "OK"
-    except AuthenticationError:
-        return False, "OpenAI rejected this key. Check it at platform.openai.com/api-keys."
-    except Exception as e:
-        return False, f"Could not connect to OpenAI: {e}"
-
+# ── Helpers ────────────────────────────────────────────────────────────────
 
 def get_pipeline():
     if st.session_state.pipeline is None:
@@ -83,54 +74,79 @@ def get_ingest_pipeline():
     return st.session_state.ingest_pipeline
 
 
-def reset_pipelines():
+def reset_pipeline():
     st.session_state.pipeline = None
     st.session_state.ingest_pipeline = None
-    st.session_state.api_key_validated = False
-    os.environ.pop("OPENAI_API_KEY", None)
 
 
 # ── SIDEBAR ────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("📚 Document Library")
 
-    with st.expander("🔑 OpenAI API Key", expanded=not st.session_state.api_key_validated):
-        env_key = os.environ.get("OPENAI_API_KEY", "")
-        if env_key and not st.session_state.api_key_validated:
-            os.environ["OPENAI_API_KEY"] = env_key
-            st.session_state.api_key_validated = True
+    # ── Ollama status ─────────────────────────────────────────────────────
+    from src.generation.generator import check_ollama_running, check_model_available
+    from src.config import settings
 
-        if st.session_state.api_key_validated:
-            st.success("✅ API key active")
-            if st.button("Change key", key="change_key"):
-                reset_pipelines()
+    with st.expander("🖥️ Ollama (Local LLM)", expanded=not st.session_state.ollama_ok):
+        ollama_running, ollama_info = check_ollama_running()
+
+        if not ollama_running:
+            st.error(f"❌ {ollama_info}")
+            st.markdown("""
+<div class="setup-step">
+<b>1.</b> Install Ollama: <a href="https://ollama.com/download" target="_blank">ollama.com/download</a>
+</div>
+<div class="setup-step">
+<b>2.</b> Pull a model: <code>ollama pull llama3.2</code>
+</div>
+<div class="setup-step">
+<b>3.</b> Start the server: <code>ollama serve</code>
+</div>
+""", unsafe_allow_html=True)
+            if st.button("🔄 Retry connection"):
                 st.rerun()
-        else:
-            typed_key = st.text_input(
-                "Paste your OpenAI API key",
-                type="password",
-                placeholder="Paste your API key here",
-                key="api_key_input",
-                help="Get your key at platform.openai.com/api-keys — stored only in this session.",
-            )
-            if st.button("✅ Validate & Save", key="validate_key"):
-                if not typed_key:
-                    st.error("Please enter a key first.")
-                else:
-                    with st.spinner("Validating…"):
-                        ok, msg = validate_api_key(typed_key)
-                    if ok:
-                        os.environ["OPENAI_API_KEY"] = typed_key
-                        st.session_state.api_key_validated = True
-                        st.success("Key validated!")
-                        st.rerun()
-                    else:
-                        st.error(f"❌ {msg}")
+            st.stop()
 
-    if not st.session_state.api_key_validated:
-        st.info("Enter your OpenAI API key above to continue. Get one at platform.openai.com/api-keys")
+        # Ollama is running — pick model
+        st.success(f"✅ Ollama running")
+
+        # List available models
+        import requests as _req
+        try:
+            _r = _req.get(f"{settings.ollama_base_url}/api/tags", timeout=3)
+            available_models = [m["name"] for m in _r.json().get("models", [])]
+        except Exception:
+            available_models = []
+
+        if not available_models:
+            st.warning("No models pulled yet.")
+            st.markdown("""
+<div class="setup-step">Run: <code>ollama pull llama3.2</code></div>
+""", unsafe_allow_html=True)
+            if st.button("🔄 Refresh"):
+                st.rerun()
+            st.stop()
+
+        default_model = settings.ollama_model
+        default_idx = 0
+        for i, m in enumerate(available_models):
+            if m.split(":")[0] == default_model.split(":")[0]:
+                default_idx = i
+                break
+
+        chosen = st.selectbox("Model", available_models, index=default_idx)
+        if chosen != st.session_state.selected_model:
+            st.session_state.selected_model = chosen
+            os.environ["OLLAMA_MODEL"] = chosen
+            reset_pipeline()
+
+        st.session_state.ollama_ok = True
+        st.caption(f"Using: `{chosen}` — swap anytime via the dropdown")
+
+    if not st.session_state.ollama_ok:
         st.stop()
 
+    # ── Upload PDFs ───────────────────────────────────────────────────────
     st.subheader("Upload PDFs")
     uploaded_files = st.file_uploader(
         "Drop PDFs here",
@@ -183,8 +199,7 @@ with st.sidebar:
                 total_chunks = sum(r.get("chunks_stored", 0) for r in results)
                 st.session_state.ingest_log.insert(0, ("success",
                     f"✅ {len(results)} file(s) indexed — {total_chunks:,} chunks stored"))
-                st.session_state.pipeline = None
-                st.session_state.ingest_pipeline = None
+                reset_pipeline()
             if errors:
                 st.session_state.ingest_log.insert(0 if not results else 1, ("warn",
                     f"⚠️ {len(errors)} file(s) failed — see details below"))
@@ -202,6 +217,7 @@ with st.sidebar:
                 else:
                     st.info(msg)
 
+    # ── Indexed documents ─────────────────────────────────────────────────
     st.subheader("Indexed Documents")
     try:
         qp = get_pipeline()
@@ -215,7 +231,7 @@ with st.sidebar:
                     if st.button("🗑 Remove", key=f"del_{doc['doc_id']}"):
                         try:
                             qp._vector_store.delete_document(doc["doc_id"])
-                            st.session_state.pipeline = None
+                            reset_pipeline()
                             st.success("Removed.")
                             st.rerun()
                         except Exception as e:
@@ -227,10 +243,11 @@ with st.sidebar:
 
     st.divider()
 
+    # ── Settings ──────────────────────────────────────────────────────────
     st.subheader("Settings")
-    streaming   = st.toggle("Streaming response",     value=True)
-    show_chunks = st.toggle("Show retrieved chunks",  value=False)
-    use_cache   = st.toggle("Use response cache",     value=True)
+    streaming   = st.toggle("Streaming response",    value=True)
+    show_chunks = st.toggle("Show retrieved chunks", value=False)
+    use_cache   = st.toggle("Use response cache",    value=True)
 
     if st.button("🗑 Clear conversation"):
         st.session_state.messages = []
@@ -246,12 +263,12 @@ with st.sidebar:
         st.caption(f"🗄 **{n:,}** chunks indexed")
     except Exception:
         st.caption("🗄 — chunks indexed")
-    st.caption("GPT-4o mini (OpenAI) · all-MiniLM-L6-v2 (local) · Hybrid RAG")
+    st.caption(f"Ollama ({st.session_state.selected_model or settings.ollama_model}) · all-MiniLM-L6-v2 · Hybrid RAG")
 
 
 # ── MAIN AREA ──────────────────────────────────────────────────────────────
 st.title("🔍 RAG Document Intelligence")
-st.caption("Ask questions across your PDF library. Answers grounded in your documents.")
+st.caption("Ask questions across your PDF library. 100% local — no API key needed.")
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
@@ -277,13 +294,8 @@ prompt = st.chat_input("Ask a question about your documents…")
 
 if prompt:
     prompt = prompt.strip()
-
     if not prompt:
         st.warning("Please type a question.")
-        st.stop()
-
-    if not st.session_state.api_key_validated:
-        st.error("Enter and validate your OpenAI API key in the sidebar first.")
         st.stop()
 
     try:
@@ -326,32 +338,19 @@ if prompt:
         except Exception as e:
             err_str = str(e)
             err_low = err_str.lower()
-            if "authentication" in err_low or "401" in err_str or ("invalid" in err_low and "key" in err_low):
-                msg = "❌ **Invalid API key.** Your OpenAI key was rejected. Re-enter it in the sidebar."
-                reset_pipelines()
-            elif "rate_limit" in err_low or "429" in err_str or "rate limit" in err_low:
-                msg = "❌ **Rate limit hit.** You've exceeded your OpenAI quota. Wait a minute or check your plan."
-            elif "insufficient_quota" in err_low or "quota" in err_low:
-                msg = "❌ **Quota exceeded.** Add credits at platform.openai.com/account/billing."
-            elif "context_length" in err_low or "too long" in err_low:
-                msg = "❌ **Context too long.** Try a more specific question."
-            elif "connection" in err_low or "timeout" in err_low or "network" in err_low:
-                msg = "❌ **Network error.** Could not reach OpenAI. Check your internet connection."
+            if "connection" in err_low or "refused" in err_low:
+                msg = "❌ **Ollama not reachable.** Make sure `ollama serve` is running."
+            elif "model" in err_low and ("not found" in err_low or "pull" in err_low):
+                msg = f"❌ **Model not found.** Run: `ollama pull {settings.ollama_model}`"
+            elif "timeout" in err_low:
+                msg = "❌ **Request timed out.** The model may be loading — try again in a moment."
             elif "no documents" in err_low or "collection" in err_low:
                 msg = "❌ **No documents found.** Upload and ingest PDFs first."
             else:
-                msg = f"❌ **Unexpected error:** {err_str}"
+                msg = f"❌ **Error:** {err_str}"
 
-            answer_box.markdown(
-                f'<div class="error-card">{msg}</div>',
-                unsafe_allow_html=True,
-            )
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": msg,
-                "citations": [],
-                "chunks": [],
-            })
+            answer_box.markdown(f'<div class="error-card">{msg}</div>', unsafe_allow_html=True)
+            st.session_state.messages.append({"role": "assistant", "content": msg, "citations": [], "chunks": []})
             st.stop()
 
         if citations:

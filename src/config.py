@@ -1,8 +1,8 @@
 """
 config.py — All settings from environment variables.
-Stack:
-  - Embeddings: local sentence-transformers (no key needed)
-  - LLM: OpenAI API — get key at https://platform.openai.com/api-keys
+Fully LOCAL stack — no API keys needed:
+  - Embeddings: sentence-transformers (local)
+  - LLM: Ollama (local) — https://ollama.com
 """
 from __future__ import annotations
 import os
@@ -21,14 +21,14 @@ class Settings:
     def __init__(self):
         pass
 
-    # ── OpenAI ────────────────────────────────────────────────────────────
+    # ── Ollama (local LLM) ────────────────────────────────────────────────
     @property
-    def openai_api_key(self) -> str:
-        return os.environ.get("OPENAI_API_KEY", "")
+    def ollama_base_url(self) -> str:
+        return os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 
     @property
-    def openai_model(self) -> str:
-        return os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    def ollama_model(self) -> str:
+        return os.environ.get("OLLAMA_MODEL", "llama3.2")
 
     # ── ChromaDB ─────────────────────────────────────────────────────────
     @property

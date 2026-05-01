@@ -90,7 +90,7 @@ class TestChunker:
 
 class TestHybridRetriever:
     @patch("src.retrieval.hybrid_retriever.OpenAI")
-    def test_rrf_merging(self, mock_openai):
+    def test_rrf_merging(self, mock_ollama):
         from src.retrieval.hybrid_retriever import HybridRetriever
 
         mock_vs = MagicMock()
@@ -109,7 +109,7 @@ class TestHybridRetriever:
         }
 
         retriever = HybridRetriever(mock_vs)
-        retriever._openai.embeddings.create.return_value = MagicMock(
+        retriever._ollama.embeddings.create.return_value = MagicMock(
             data=[MagicMock(embedding=[0.1] * 1536)]
         )
 
