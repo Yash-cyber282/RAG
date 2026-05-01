@@ -1,11 +1,11 @@
 """
 generation/generator.py
 
-Fully LOCAL LLM using HuggingFace Transformers pipeline.
+Fully LOCAL LLM using HuggingFace Transformers.
+Uses AutoModel directly — compatible with transformers v4 and v5.
 No Ollama. No API key. No internet after first model download.
 
 Default model: google/flan-t5-base (~250MB, CPU-friendly)
-Swap via HFLOCAL_MODEL env var for larger models if you have GPU.
 """
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ class GeneratedAnswer:
 
 
 # ─────────────────────────────────────────────
-# System prompt / prompt builder
+# Prompt builder
 # ─────────────────────────────────────────────
 
 def _build_prompt(query: str, chunks: list[RetrievedChunk], history: list[dict]) -> str:
@@ -60,10 +60,10 @@ def _build_prompt(query: str, chunks: list[RetrievedChunk], history: list[dict])
 
     history_str = ""
     if history:
-        turns = []
-        for msg in history:
-            role = "User" if msg["role"] == "user" else "Assistant"
-            turns.append(f"{role}: {msg['content']}")
+        turns = [
+            f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
+            for m in history
+        ]
         history_str = "\n".join(turns) + "\n\n"
 
     return (
@@ -114,42 +114,82 @@ class ConversationMemory:
 # Model loader (cached in memory)
 # ─────────────────────────────────────────────
 
-_pipeline = None
+_model_cache: dict = {}
 
 
-def _get_pipeline():
-    global _pipeline
-    if _pipeline is not None:
-        return _pipeline
+def _is_seq2seq(model_name: str) -> bool:
+    """Detect encoder-decoder models (T5, BART, etc.) vs causal LMs."""
+    name = model_name.lower()
+    return any(x in name for x in ["t5", "bart", "pegasus", "mt5", "mbart"])
 
-    from transformers import pipeline as hf_pipeline
+
+def _get_model(model_name: str):
+    """Load and cache model + tokenizer. Auto-detects seq2seq vs causal."""
+    if model_name in _model_cache:
+        return _model_cache[model_name]
+
+    import torch
+    from transformers import AutoTokenizer
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"Loading model: {model_name} on {device.upper()} (first run downloads it)")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    if _is_seq2seq(model_name):
+        from transformers import AutoModelForSeq2SeqLM
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    else:
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        )
+
+    model = model.to(device)
+    model.eval()
+
+    _model_cache[model_name] = (tokenizer, model, device)
+    logger.success(f"Model ready: {model_name}")
+    return _model_cache[model_name]
+
+
+def _run_inference(prompt: str, model_name: str) -> str:
     import torch
 
-    model_name = settings.hf_model
-    logger.info(f"Loading HuggingFace model: {model_name} (first run downloads it)")
+    tokenizer, model, device = _get_model(model_name)
 
-    device = 0 if torch.cuda.is_available() else -1  # GPU if available, else CPU
-    device_label = "GPU" if device == 0 else "CPU"
-    logger.info(f"Running on {device_label}")
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=1024,
+    ).to(device)
 
-    # Detect model type for correct task
-    name_lower = model_name.lower()
-    if any(x in name_lower for x in ["t5", "bart", "pegasus"]):
-        task = "text2text-generation"
-    else:
-        task = "text-generation"
+    with torch.no_grad():
+        if _is_seq2seq(model_name):
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=512,
+                num_beams=2,
+                early_stopping=True,
+            )
+            # seq2seq: output is just the answer tokens
+            answer = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        else:
+            input_len = inputs["input_ids"].shape[1]
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=512,
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+            # causal LM: output includes the prompt, strip it
+            answer = tokenizer.decode(
+                output_ids[0][input_len:], skip_special_tokens=True
+            )
 
-    _pipeline = hf_pipeline(
-        task,
-        model=model_name,
-        device=device,
-        max_new_tokens=512,
-        do_sample=False,          # deterministic for RAG
-        temperature=None,
-        top_p=None,
-    )
-    logger.success(f"Model ready: {model_name}")
-    return _pipeline
+    return answer.strip()
 
 
 def check_model_ready() -> tuple[bool, str]:
@@ -176,20 +216,6 @@ class RAGGenerator:
         payload = query + "|" + ",".join(sorted(chunk_ids))
         return "gen:" + hashlib.md5(payload.encode()).hexdigest()
 
-    def _run_inference(self, prompt: str) -> str:
-        pipe = _get_pipeline()
-        result = pipe(prompt)
-        if isinstance(result, list) and result:
-            out = result[0]
-            # text2text-generation returns {"generated_text": ...}
-            # text-generation returns {"generated_text": full_prompt + answer}
-            text = out.get("generated_text", "")
-            # Strip the prompt prefix for causal LMs
-            if text.startswith(prompt):
-                text = text[len(prompt):]
-            return text.strip()
-        return ""
-
     def generate(
         self,
         query: str,
@@ -204,7 +230,7 @@ class RAGGenerator:
 
         history = memory.as_messages() if memory else []
         prompt = _build_prompt(query, chunks, history)
-        answer_text = self._run_inference(prompt)
+        answer_text = _run_inference(prompt, self._model_name)
 
         result = GeneratedAnswer(
             answer=answer_text,
@@ -224,16 +250,13 @@ class RAGGenerator:
         chunks: list[RetrievedChunk],
         memory: ConversationMemory | None = None,
     ) -> tuple[Generator[str, None, None], list[Citation]]:
-        """
-        HuggingFace pipelines don't natively stream token-by-token easily,
-        so we run inference fully and yield word-by-word for a streaming feel.
-        """
+        """Run inference then yield word-by-word for a streaming feel."""
         citations = _extract_citations(chunks)
         history = memory.as_messages() if memory else []
         prompt = _build_prompt(query, chunks, history)
 
         def _word_stream() -> Iterator[str]:
-            answer = self._run_inference(prompt)
+            answer = _run_inference(prompt, self._model_name)
             words = answer.split(" ")
             for i, word in enumerate(words):
                 yield word + ("" if i == len(words) - 1 else " ")
